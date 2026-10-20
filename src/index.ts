@@ -1,14 +1,19 @@
-﻿import { existsSync } from "node:fs";
+﻿
+import { existsSync } from "node:fs";
 import { cpus, freemem, platform, release, totalmem } from "node:os";
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import * as z from "zod/v4";
+
 import { askOllama } from "./ollama.js";
 import {
   createTask,
   listTasks,
-  updateTask
+  updateTask,
+  saveProjectCheck,
+  listProjectChecks
 } from "./database.js";
+import { checkProject } from "./project-check.js";
 
 const projectRoots = [
   { name: "Account OS", path: "E:\\Account OS" },
@@ -16,7 +21,15 @@ const projectRoots = [
   { name: "Le Grain OS", path: "E:\\Le Grain OS" },
   { name: "Performance Buddy OS", path: "E:\\Performance Buddy OS" },
   { name: "TinyTots OS", path: "E:\\TINYTOTS OS" }
-];
+] as const;
+
+const configuredProjectNames = [
+  "Account OS",
+  "AIxBilal Projects",
+  "Le Grain OS",
+  "Performance Buddy OS",
+  "TinyTots OS"
+] as const;
 
 serveStdio(() => {
   const server = new McpServer({
@@ -27,7 +40,8 @@ serveStdio(() => {
   server.registerTool(
     "hub_status",
     {
-      description: "Return basic runtime and system resource information for the local AI Hub.",
+      description:
+        "Return basic runtime and system resource information for the local AI Hub.",
       inputSchema: z.object({})
     },
     async () => {
@@ -39,8 +53,12 @@ serveStdio(() => {
         osRelease: release(),
         nodeVersion: process.version,
         logicalCpuCount: cpus().length,
-        totalSystemMemoryGB: Number((totalmem() / 1024 ** 3).toFixed(1)),
-        freeSystemMemoryGB: Number((freemem() / 1024 ** 3).toFixed(1)),
+        totalSystemMemoryGB: Number(
+          (totalmem() / 1024 ** 3).toFixed(1)
+        ),
+        freeSystemMemoryGB: Number(
+          (freemem() / 1024 ** 3).toFixed(1)
+        ),
         timestamp: new Date().toISOString()
       };
 
@@ -55,7 +73,8 @@ serveStdio(() => {
   server.registerTool(
     "list_project_roots",
     {
-      description: "List the configured AIxBilal project folders and whether each exists. Does not read project files.",
+      description:
+        "List configured project folders and whether each exists. Does not read project files.",
       inputSchema: z.object({})
     },
     async () => {
@@ -72,6 +91,67 @@ serveStdio(() => {
       };
     }
   );
+
+  server.registerTool(
+    "check_project",
+    {
+      description:
+        "Read-only inspection of one configured project. Counts files and directories, skips excluded generated folders, and saves the inspection report in the local database. Does not modify project files.",
+      inputSchema: z.object({
+        projectName: z.enum(configuredProjectNames)
+      })
+    },
+    async ({ projectName }) => {
+      try {
+        const project = projectRoots.find(
+          (item) => item.name === projectName
+        );
+
+        if (!project) {
+          return {
+            content: [{
+              type: "text",
+              text: "The requested project is not configured."
+            }],
+            isError: true
+          };
+        }
+
+        const result = checkProject(project.name, project.path);
+
+        const checkId = saveProjectCheck({
+          projectName: result.projectName,
+          projectPath: result.projectPath,
+          status: result.status,
+          fileCount: result.fileCount,
+          directoryCount: result.directoryCount,
+          checkedAt: result.checkedAt,
+          errors: result.errors
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              checkId,
+              ...result
+            }, null, 2)
+          }]
+        };
+      } catch (error) {
+        return {
+          content: [{
+            type: "text",
+            text: error instanceof Error
+              ? error.message
+              : "Could not check the configured project."
+          }],
+          isError: true
+        };
+      }
+    }
+  );
+
   server.registerTool(
     "ask_local_ai",
     {
@@ -93,15 +173,16 @@ serveStdio(() => {
           error instanceof Error ? error.message : "Unknown error";
 
         return {
-          content: [
-            { type: "text", text: `Local AI request failed: ${message}` }
-          ],
+          content: [{
+            type: "text",
+            text: `Local AI request failed: ${message}`
+          }],
           isError: true
         };
       }
     }
   );
-  
+
   server.registerTool(
     "create_task",
     {
@@ -128,7 +209,9 @@ serveStdio(() => {
         return {
           content: [{
             type: "text",
-            text: error instanceof Error ? error.message : "Could not create task."
+            text: error instanceof Error
+              ? error.message
+              : "Could not create task."
           }],
           isError: true
         };
@@ -154,7 +237,9 @@ serveStdio(() => {
         return {
           content: [{
             type: "text",
-            text: error instanceof Error ? error.message : "Could not list tasks."
+            text: error instanceof Error
+              ? error.message
+              : "Could not list tasks."
           }],
           isError: true
         };
@@ -162,17 +247,17 @@ serveStdio(() => {
     }
   );
 
-  
   server.registerTool(
     "hub_review",
     {
       description:
-        "Summarize saved AI Hub tasks by status and identify pending work. Read-only; does not change tasks.",
+        "Summarize saved AI Hub tasks and recent project inspections, highlighting items that need attention. Read-only; does not change tasks or project files.",
       inputSchema: z.object({})
     },
     async () => {
       try {
         const tasks = listTasks();
+        const projectChecks = listProjectChecks();
 
         const pending = tasks.filter(
           (task) => task.status === "pending"
@@ -184,26 +269,52 @@ serveStdio(() => {
           (task) => task.status === "failed"
         );
 
+        const incompleteChecks = projectChecks.filter(
+          (check) => check.status === "incomplete"
+        );
+        const failedChecks = projectChecks.filter(
+          (check) => check.status === "failed"
+        );
+
         const report = {
           generatedAt: new Date().toISOString(),
-          totalTasks: tasks.length,
-          counts: {
-            pending: pending.length,
-            completed: completed.length,
-            failed: failed.length
+
+          tasks: {
+            total: tasks.length,
+            counts: {
+              pending: pending.length,
+              completed: completed.length,
+              failed: failed.length
+            },
+            needsAttention: pending.map((task) => ({
+              id: task.id,
+              title: task.title,
+              status: task.status
+            })),
+            recent: tasks.slice(0, 10).map((task) => ({
+              id: task.id,
+              title: task.title,
+              status: task.status,
+              result: task.result,
+              updatedAt: task.updated_at
+            }))
           },
-          needsAttention: pending.map((task) => ({
-            id: task.id,
-            title: task.title,
-            status: task.status
-          })),
-          recentTasks: tasks.slice(0, 10).map((task) => ({
-            id: task.id,
-            title: task.title,
-            status: task.status,
-            result: task.result,
-            updatedAt: task.updated_at
-          }))
+
+          projectChecks: {
+            recentCount: projectChecks.length,
+            counts: {
+              completed: projectChecks.filter(
+                (check) => check.status === "completed"
+              ).length,
+              incomplete: incompleteChecks.length,
+              failed: failedChecks.length
+            },
+            needsAttention: [
+              ...incompleteChecks,
+              ...failedChecks
+            ],
+            recent: projectChecks
+          }
         };
 
         return {
@@ -250,7 +361,9 @@ serveStdio(() => {
         return {
           content: [{
             type: "text",
-            text: error instanceof Error ? error.message : "Could not update task."
+            text: error instanceof Error
+              ? error.message
+              : "Could not update task."
           }],
           isError: true
         };
